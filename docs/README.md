@@ -50,3 +50,5 @@ docs/
 - `docs/docs/zh/guide/contribution.md` ↔ `CONTRIBUTING_zh_CN.md`
 
 修改时请同时更新两个位置的文档以确保一致性。
+
+<!-- pages trigger test -->

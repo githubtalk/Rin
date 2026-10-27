@@ -1,0 +1,103 @@
+# 每日同步上游 openRin/Rin 到本 fork，并自动触发部署。
+#
+# 上游没有提供 fork 同步机制，本 fork 需要手动合并上游才能拿到更新，
+# 线上因此长期滞后。本 workflow 每天自动完成同步 + 合并 + 部署。
+#
+# fork 的自定义改动只有 client/index.html 里的 AdSense 脚本。
+# 合并冲突时优先保留 fork 版本（git checkout --ours），其余文件正常合并，
+# 保证自定义不被上游覆盖，同时不丢失上游的功能更新。
+name: Sync upstream Rin
+
+on:
+  schedule:
+    # 每天 05:07 UTC
+    - cron: "7 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rin-sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository != 'openRin/Rin'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      BASE_BRANCH: ${{ github.event.repository.default_branch }}
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM_REPOSITORY: openRin/Rin
+    steps:
+      - name: Check out deployment repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Merge upstream main
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git remote add rin-upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags rin-upstream main
+          upstream_sha="$(git rev-parse rin-upstream/main)"
+          current_sha="$(git rev-parse HEAD)"
+          echo "upstream_sha=${upstream_sha}" >> "$GITHUB_OUTPUT"
+          echo "current_sha=${current_sha}" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "${upstream_sha}" HEAD; then
+            echo "Already up to date with upstream (${upstream_sha})."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name "rin-sync[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          merge_output="$(mktemp)"
+          if git merge --no-edit --no-ff "${upstream_sha}" > "${merge_output}" 2>&1; then
+            echo "Merged upstream ${upstream_sha} cleanly."
+          else
+            echo "Merge reported conflicts; resolving by keeping fork versions." >&2
+            cat "${merge_output}" >&2
+            # 保留 fork 侧版本解决冲突：client/index.html 的 AdSense 脚本是本 fork
+            # 唯一的自定义改动，不能被上游覆盖。其余冲突文件同样取 fork 版本，
+            # 避免 CI 因未解决冲突而卡住。
+            git checkout --ours -- client/index.html 2>/dev/null || true
+            git add client/index.html 2>/dev/null || true
+            # 其余仍在冲突中的文件：取 fork 版本并标记已解决
+            for conflicted in $(git diff --name-only --diff-filter=U); do
+              git checkout --ours -- "${conflicted}" 2>/dev/null || true
+              git add "${conflicted}" 2>/dev/null || true
+            done
+            if ! git commit --no-edit; then
+              echo "Could not resolve merge conflicts automatically. Resolve manually." >&2
+              exit 1
+            fi
+          fi
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Push merge to main
+        if: steps.merge.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push origin "HEAD:${BASE_BRANCH}"
+          echo "Pushed upstream merge; Build -> Deploy will publish it."
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "### Rin upstream sync"
+            echo
+            echo "- upstream: \`${UPSTREAM_REPOSITORY}\`"
+            echo "- upstream sha: \`${{ steps.merge.outputs.upstream_sha || 'n/a' }}\`"
+            echo "- merged: \`${{ steps.merge.outputs.changed || 'false' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
